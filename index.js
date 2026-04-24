@@ -584,7 +584,17 @@ app.post("/callback-payout", async (req, res) => {
     });
   }
 });
+app.get("/health", (req, res) => {
+  const ref = (process.env.SUPABASE_URL || "")
+    .match(/https:\/\/([^.]+)\.supabase\.co/)?.[1] || null;
 
+  res.json({
+    status: "ok",
+    supabase_project_ref: ref,
+    has_service_role: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+    timestamp: new Date().toISOString(),
+  });
+});
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
