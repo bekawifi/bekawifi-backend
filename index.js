@@ -403,198 +403,203 @@ app.get("/balance", checkAuth, async (req, res) => {
 
 app.post("/callback-ligdicash", async (req, res) => {
   try {
-    const payload = req.body;
+    const payload = req.body || {};
 
-    const transactionId =
+    // 1. Extraire transaction_id (gère tous les formats LigdiCash)
+    let transactionId = null;
+    if (Array.isArray(payload.custom_data)) {
+      const item = payload.custom_data.find(
+        (i) => i.keyof_customdata === "transaction_id"
+      );
+      transactionId = item?.valueof_customdata || null;
+    }
+    transactionId =
+      transactionId ||
       payload?.custom_data?.transaction_id ||
-      payload?.custom_data?.valueof_customdata ||
-      payload?.externe_id ||
       payload?.external_id ||
-      payload?.transaction_id;
+      payload?.externe_id ||
+      payload?.transaction_id ||
+      null;
 
-    const status =
-      payload?.status ||
-      payload?.statut ||
-      payload?.response_status ||
-      payload?.response_code;
+    const rawStatus = payload?.status || payload?.statut || null;
+    const responseCode = payload?.response_code || null;
 
-    const { data: callbackLog } = await supabase
-      .from("ligdicash_callbacks")
-      .insert({
-        raw_body: payload,
-        parsed_data: payload,
-        source_ip: req.ip,
-        http_method: req.method,
-        callback_type: "payment",
-      })
-      .select()
-      .single();
-
-    if (!transactionId) {
-      return res.status(200).json({ success: true });
+    // 2. Logger le callback (best effort)
+    let callbackLogId = null;
+    try {
+      const { data: log } = await supabase
+        .from("ligdicash_callbacks")
+        .insert({
+          callback_type: "payment",
+          http_method: req.method,
+          source_ip: req.ip,
+          raw_body: JSON.stringify(payload).substring(0, 5000),
+          parsed_data: payload,
+          transaction_id: transactionId,
+          status: rawStatus,
+          response_code: responseCode,
+        })
+        .select("id")
+        .single();
+      callbackLogId = log?.id || null;
+    } catch (e) {
+      console.error("Log insert failed:", e);
     }
 
-    const { data: paiement } = await supabase
+    if (!transactionId) {
+      return res.status(200).json({ success: true, warning: "no transaction_id" });
+    }
+
+    // 3. Récupérer le paiement
+    const { data: paiement, error: fetchErr } = await supabase
       .from("paiements")
-      .select("*")
+      .select("id, statut, ligdicash_token, tarif_id, hotspot_id, montant")
       .eq("custom_transaction_id", transactionId)
       .single();
 
-    if (!paiement) {
-      return res.status(200).json({ success: true });
+    if (fetchErr || !paiement) {
+      if (callbackLogId) {
+        await supabase
+          .from("ligdicash_callbacks")
+          .update({ processing_result: "not_found", error_message: "Paiement introuvable" })
+          .eq("id", callbackLogId);
+      }
+      return res.status(200).json({ success: true, warning: "paiement not found" });
     }
 
-    if (status === "completed" || payload.response_code === "00") {
-      let ticketId = null;
+    // 4. Idempotence : déjà complété ?
+    if (paiement.statut === "completed") {
+      if (callbackLogId) {
+        await supabase
+          .from("ligdicash_callbacks")
+          .update({ paiement_id: paiement.id, processing_result: "duplicate" })
+          .eq("id", callbackLogId);
+      }
+      return res.status(200).json({ success: true, already_processed: true });
+    }
 
-      const { data: sellResult, error: sellError } = await supabase.rpc(
-        "sell_ticket",
-        {
-          _tarif_id: paiement.tarif_id,
-          _vendeur_id: paiement.vendeur_id || null,
-          _profil_mikrotik: paiement.profil_mikrotik || null,
-          _montant: paiement.montant,
-          _hotspot_id: paiement.hotspot_id,
-        }
+    // 5. Vérification serveur-à-serveur auprès de LigdiCash (anti-spoofing)
+    let verified = null;
+    if (paiement.ligdicash_token) {
+      const verify = await ligdicashFetch(
+        `/pay/v01/redirect/checkout-invoice/confirm/?invoiceToken=${paiement.ligdicash_token}`,
+        { method: "GET" }
       );
+      if (verify.ok) verified = verify.data;
+    }
 
-      if (!sellError && sellResult) {
-        ticketId = Array.isArray(sellResult)
-          ? sellResult[0]?.ticket_id || sellResult[0]?.id
-          : sellResult.ticket_id || sellResult.id;
+    const isCompleted =
+      (verified?.response_code === "00" && verified?.status === "completed") ||
+      rawStatus === "completed" ||
+      responseCode === "00";
+
+    const isFailed =
+      verified?.status === "nocompleted" ||
+      rawStatus === "failed" ||
+      rawStatus === "nocompleted";
+
+    // 6. Mise à jour + attribution ticket
+    if (isCompleted) {
+      // Attribuer un ticket disponible directement (sans sell_ticket qui exige auth.uid())
+      let ticketId = null;
+      if (paiement.tarif_id && paiement.hotspot_id) {
+        const { data: tarif } = await supabase
+          .from("tarifs")
+          .select("profil_mikrotik")
+          .eq("id", paiement.tarif_id)
+          .single();
+
+        if (tarif?.profil_mikrotik) {
+          const { data: ticket } = await supabase
+            .from("tickets")
+            .select("id")
+            .eq("statut", "disponible")
+            .eq("hotspot_id", paiement.hotspot_id)
+            .eq("profil", tarif.profil_mikrotik)
+            .order("imported_at", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+
+          if (ticket?.id) {
+            await supabase
+              .from("tickets")
+              .update({
+                statut: "vendu",
+                sold_at: new Date().toISOString(),
+                tarif_id: paiement.tarif_id,
+              })
+              .eq("id", ticket.id);
+            ticketId = ticket.id;
+
+            // Créer la vente
+            const { data: hotspot } = await supabase
+              .from("hotspots")
+              .select("user_id")
+              .eq("id", paiement.hotspot_id)
+              .single();
+
+            if (hotspot?.user_id) {
+              await supabase.from("ventes").insert({
+                ticket_id: ticket.id,
+                tarif_id: paiement.tarif_id,
+                vendeur_id: hotspot.user_id,
+                montant: paiement.montant,
+              });
+            }
+          }
+        }
       }
 
       await supabase
         .from("paiements")
         .update({
           statut: "completed",
-          telephone: payload.customer || payload.telephone || null,
           ticket_id: ticketId,
+          ligdicash_transaction_id:
+            verified?.transaction_id || payload.transaction_id || null,
+          telephone: verified?.customer || payload.customer || payload.telephone || null,
         })
         .eq("id", paiement.id);
+
+      if (callbackLogId) {
+        await supabase
+          .from("ligdicash_callbacks")
+          .update({
+            paiement_id: paiement.id,
+            processing_result: ticketId ? "success" : "success_no_ticket",
+            status: "completed",
+          })
+          .eq("id", callbackLogId);
+      }
+
+      return res.status(200).json({ success: true, status: "completed", ticket_id: ticketId });
     }
 
-    if (status === "failed") {
-      await supabase
-        .from("paiements")
-        .update({ statut: "failed" })
-        .eq("id", paiement.id);
-    }
+    // 7. Échec ou pending
+    const newStatus = isFailed ? "failed" : "pending";
+    await supabase
+      .from("paiements")
+      .update({ statut: newStatus })
+      .eq("id", paiement.id);
 
-    if (callbackLog?.id) {
+    if (callbackLogId) {
       await supabase
         .from("ligdicash_callbacks")
         .update({
           paiement_id: paiement.id,
-          processing_result: { success: true, transactionId, status },
+          processing_result: "success",
+          status: newStatus,
         })
-        .eq("id", callbackLog.id);
+        .eq("id", callbackLogId);
     }
 
-    return res.status(200).json({ success: true });
+    return res.status(200).json({ success: true, status: newStatus });
   } catch (error) {
     console.error("Erreur callback-ligdicash:", error);
-
     return res.status(200).json({
       success: true,
-      warning: "Erreur interne mais réponse 200 envoyée à LigdiCash",
+      warning: "Erreur interne, 200 envoyé pour éviter les retries",
     });
   }
 });
 
-/* =========================
-   CALLBACK PAYOUT
-========================= */
-
-app.post("/callback-payout", async (req, res) => {
-  try {
-    const payload = req.body;
-
-    const payoutToken =
-      payload.token ||
-      payload.payout_token ||
-      payload.transaction_token ||
-      payload.transaction_id;
-
-    const status =
-      payload.status ||
-      payload.statut ||
-      payload.response_status ||
-      payload.response_code;
-
-    await supabase.from("ligdicash_callbacks").insert({
-      raw_body: payload,
-      parsed_data: payload,
-      source_ip: req.ip,
-      http_method: req.method,
-      callback_type: "payout",
-    });
-
-    if (!payoutToken) {
-      return res.status(200).json({ success: true });
-    }
-
-    const { data: retrait } = await supabase
-      .from("retraits")
-      .select("*")
-      .eq("payout_token", payoutToken)
-      .single();
-
-    if (!retrait) {
-      return res.status(200).json({ success: true });
-    }
-
-    if (status === "success" || status === "completed" || payload.response_code === "00") {
-      await supabase
-        .from("retraits")
-        .update({
-          statut: "valide",
-          payout_status: "completed",
-          validated_at: new Date().toISOString(),
-        })
-        .eq("id", retrait.id);
-    }
-
-    if (status === "failed") {
-      await supabase
-        .from("retraits")
-        .update({
-          statut: "refuse",
-          payout_status: "failed",
-          motif_refus: payload.response_text || "Payout échoué",
-        })
-        .eq("id", retrait.id);
-    }
-
-    await supabase
-      .from("payout_attempts")
-      .update({
-        status,
-        response_payload: payload,
-      })
-      .eq("retrait_id", retrait.id);
-
-    return res.status(200).json({ success: true });
-  } catch (error) {
-    console.error("Erreur callback-payout:", error);
-
-    return res.status(200).json({
-      success: true,
-      warning: "Erreur interne mais réponse 200 envoyée à LigdiCash",
-    });
-  }
-});
-app.get("/health", (req, res) => {
-  const ref = (process.env.SUPABASE_URL || "")
-    .match(/https:\/\/([^.]+)\.supabase\.co/)?.[1] || null;
-
-  res.json({
-    status: "ok",
-    supabase_project_ref: ref,
-    has_service_role: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-    timestamp: new Date().toISOString(),
-  });
-});
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
